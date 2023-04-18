@@ -25,8 +25,9 @@ use stm32l4xx_hal::{
     can::Can,
     device::CAN1,
     flash::FlashExt,
-    gpio::{Alternate, Output, PushPull, PA11, PA12, PB13},
+    gpio::{Alternate, Output, PushPull, PA10, PA11, PA12, PA9, PB13},
     prelude::*,
+    serial::{Config, Serial},
     watchdog::IndependentWatchdog,
 };
 
@@ -37,6 +38,7 @@ const SYSCLK: u32 = 80_000_000;
 mod app {
 
     use bxcan::{filter::Mask32, Interrupts};
+    use stm32l4xx_hal::device::USART1;
 
     use super::*;
 
@@ -47,7 +49,16 @@ mod app {
 
     #[shared]
     struct Shared {
-        can: bxcan::Can<Can<CAN1, (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>)>>,
+        can: bxcan::Can<
+            Can<
+                CAN1,
+                (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>),
+            >,
+        >,
+        uart: Serial<
+            USART1,
+            (PA9<Alternate<PushPull, 7>>, PA10<Alternate<PushPull, 7>>),
+        >,
     }
 
     #[local]
@@ -85,17 +96,23 @@ mod app {
 
         // configure can bus
         let can = {
-            let rx =
-                gpioa
-                    .pa11
-                    .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
-            let tx =
-                gpioa
-                    .pa12
-                    .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrh);
+            let rx = gpioa.pa11.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
+            let tx = gpioa.pa12.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
 
-            let can = bxcan::Can::builder(Can::new(&mut rcc.apb1r1, cx.device.CAN1, (tx, rx)))
-                .set_bit_timing(0x001c_0009); // 500kbit/s
+            let can = bxcan::Can::builder(Can::new(
+                &mut rcc.apb1r1,
+                cx.device.CAN1,
+                (tx, rx),
+            ))
+            .set_bit_timing(0x001c_0009); // 500kbit/s
 
             let mut can = can.enable();
 
@@ -116,6 +133,28 @@ mod app {
             can
         };
 
+        let mut uart = {
+            let tx = gpioa.pa9.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
+
+            let rx = gpioa.pa10.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
+
+            Serial::usart1(
+                cx.device.USART1,
+                (tx, rx),
+                Config::default().baudrate(9_600.bps()),
+                clocks,
+                &mut rcc.apb2,
+            )
+        };
+
         let watchdog = {
             let mut wd = IndependentWatchdog::new(cx.device.IWDG);
             wd.stop_on_debug(&cx.device.DBGMCU, true);
@@ -123,9 +162,9 @@ mod app {
 
             wd
         };
-
+        
         (
-            Shared { can },
+            Shared { can, uart },
             Local {
                 watchdog,
                 status_led,
