@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+at-commands = "0.5.3"
 bxcan = { version = "0.6.0", features = ["unstable-defmt"] }
 cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7.2"
@@ -21,12 +22,12 @@ dwt-systick-monotonic = { version = "1.1.0", features = ["extend"] }
 
 [dependencies.solar-car]
 version = "0.1.1"
-git = "https://gitlab.com/team-arrow-racing/arrow-3/solar-car"
+git = "https://github.com/team-arrow-racing/solar-car-common"
 # path = "../solar-car" # for local development
 
 [dependencies.wurth-calypso]
 version = "0.1.0"
-git = "https://gitlab.com/team-arrow-racing/wurth-calypso"
+git = "https://github.com/team-arrow-racing/wurth-calypso-rs"
 # path = "../wurth-calpyso" # for local development
 
 [[bin]]

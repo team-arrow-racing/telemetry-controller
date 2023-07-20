@@ -19,16 +19,28 @@
 use defmt_rtt as _;
 use panic_probe as _;
 
+#[macro_use(singleton)]
+extern crate cortex_m;
+
+use at_commands::builder::CommandBuilder;
+use at_commands::parser::CommandParser;
+
 use dwt_systick_monotonic::{fugit, DwtSystick};
 use solar_car::{com, device};
 use stm32l4xx_hal::{
     can::Can,
     device::CAN1,
+    dma::{self, CircBuffer, CircReadDma, RxDma},
     flash::FlashExt,
     gpio::{Alternate, Output, PushPull, PA10, PA11, PA12, PA9, PB13},
+    pac::{USART1, USART2},
     prelude::*,
-    serial::{Config, Serial},
+    serial::{self, Config, Serial, Tx, Rx},
     watchdog::IndependentWatchdog,
+};
+
+use wurth_calypso::{
+    Calypso
 };
 
 const DEVICE: device::Device = device::Device::SteeringWheel;
@@ -36,9 +48,7 @@ const SYSCLK: u32 = 80_000_000;
 
 #[rtic::app(device = stm32l4xx_hal::pac, dispatchers = [SPI1, SPI2, SPI3, QUADSPI])]
 mod app {
-
     use bxcan::{filter::Mask32, Interrupts};
-    use stm32l4xx_hal::device::USART1;
 
     use super::*;
 
@@ -55,16 +65,19 @@ mod app {
                 (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>),
             >,
         >,
-        uart: Serial<
-            USART1,
-            (PA9<Alternate<PushPull, 7>>, PA10<Alternate<PushPull, 7>>),
-        >,
+        // uart: Serial<
+        //     USART1,
+        //     (PA9<Alternate<PushPull, 7>>, PA10<Alternate<PushPull, 7>>),
+        // >,
+        tx: Tx<USART2>,
+        // rx: Rx<USART1>,
     }
 
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
         status_led: PB13<Output<PushPull>>,
+        circ_buffer: CircBuffer<[u8; 32], RxDma<Rx<USART2>, dma::dma1::C6>>
     }
 
     #[init]
@@ -134,26 +147,31 @@ mod app {
         };
 
         let mut uart = {
-            let tx = gpioa.pa9.into_alternate(
+            let tx = gpioa.pa2.into_alternate(
                 &mut gpioa.moder,
                 &mut gpioa.otyper,
-                &mut gpioa.afrh,
+                &mut gpioa.afrl,
             );
 
-            let rx = gpioa.pa10.into_alternate(
+            let rx = gpioa.pa3.into_alternate(
                 &mut gpioa.moder,
                 &mut gpioa.otyper,
-                &mut gpioa.afrh,
+                &mut gpioa.afrl,
             );
 
-            Serial::usart1(
-                cx.device.USART1,
+            Serial::usart2(
+                cx.device.USART2,
                 (tx, rx),
-                Config::default().baudrate(9_600.bps()),
+                Config::default()
+                    .baudrate(921_600.bps())
+                    .parity_even()
+                    .character_match(b'\n'),
                 clocks,
-                &mut rcc.apb2,
+                &mut rcc.apb1r1,
             )
         };
+
+        uart.listen(serial::Event::Rxne);
 
         let watchdog = {
             let mut wd = IndependentWatchdog::new(cx.device.IWDG);
@@ -162,15 +180,76 @@ mod app {
 
             wd
         };
+
+        let (tx, rx) = uart.split();
+
+        let channels = cx.device.DMA1.split(&mut rcc.ahb1);
+        let buf = singleton!(: [u8; 32] = [0; 32]).unwrap();
+        let circ_buffer = rx.with_dma(channels.6).circ_read(buf);
+
+        // start main loop
+        run::spawn().unwrap();
+        calypso_comms::spawn().unwrap();
         
         (
-            Shared { can, uart },
+            Shared { 
+                can,
+                tx,
+                // rx
+            },
             Local {
                 watchdog,
                 status_led,
+                circ_buffer
             },
             init::Monotonics(mono),
         )
+    }
+
+    #[task(priority = 1, local = [watchdog])]
+    fn run(cx: run::Context) {
+        defmt::trace!("task: run");
+
+        cx.local.watchdog.feed();
+
+        run::spawn_after(Duration::millis(10)).unwrap();
+    }
+
+    #[task(priority = 1, shared = [tx])]
+    fn calypso_comms(mut cx: calypso_comms::Context) {
+        let mut buffer = [0; 128];
+
+        let command = CommandBuilder::create_execute(&mut buffer, true)
+            .named("+test")
+            .finish()
+            .unwrap();
+
+        defmt::debug!("Writing {:?}", core::str::from_utf8(command).unwrap());
+
+        cx.shared.tx.lock(|tx| {
+            let _ = command
+                .iter()
+                .map(|c| nb::block!(tx.write(*c)))
+                .last();
+        });
+
+        calypso_comms::spawn_after(Duration::millis(2000)).unwrap();
+    }
+
+    #[task(binds = USART2, local = [circ_buffer])]
+    fn uart_read(cx: uart_read::Context) {
+        let mut rx_buf = [0; 32];
+
+        let rx_res = cx.local.circ_buffer.read(&mut rx_buf);
+        match rx_res {
+            Err(_) => (),
+            Ok(rx_len) => {
+                defmt::debug!("{:?}", core::str::from_utf8(&rx_buf[..rx_len]).unwrap());
+                // TODO for parsing AT commands
+                // let a = CommandParser::parse(&rx_buf).finish().unwrap();
+                // defmt::debug!("{:?}", a);
+            }
+        }        
     }
 }
 
