@@ -19,32 +19,138 @@
 use defmt_rtt as _;
 use panic_probe as _;
 
-#[macro_use(singleton)]
-extern crate cortex_m;
-
 use at_commands::builder::CommandBuilder;
 use at_commands::parser::CommandParser;
 
+
+use heapless::{
+    pool,
+    pool::singleton::{Box, Pool},
+};
+
+// The pool gives out `Box<DMAFrame>`s that can hold 8 bytes
+pool!(
+    #[allow(non_upper_case_globals)]
+    SerialDMAPool: DMAFrame<32>
+);
+
+use bxcan::{self, filter::Mask32, Frame, Id, Interrupts};
+
 use dwt_systick_monotonic::{fugit, DwtSystick};
-use solar_car::{com, device};
+
+use embedded_hal::{
+    spi::{Mode, Phase, Polarity}
+};
+
+use embedded_sdmmc::{
+    TimeSource, Timestamp, SdCard,
+};
+
+use solar_car::{
+    com, device, j1939,
+    j1939::pgn::{Number, Pgn},
+};
 use stm32l4xx_hal::{
     can::Can,
     device::CAN1,
-    dma::{self, CircBuffer, CircReadDma, RxDma},
+    delay::DelayCM,
+    dma::{self, RxDma, TxDma, DMAFrame, FrameReader, FrameSender},
     flash::FlashExt,
-    gpio::{Alternate, Output, PushPull, PA10, PA11, PA12, PA9, PB13},
-    pac::{USART1, USART2},
+    gpio::{Alternate, OpenDrain, Output, PushPull, PA4, PA5, PA6, PA7, PA11, PA12, PB8, PB9, PB13, PC8, PC9, PC12, PD2, Speed},
+    pac::{USART2, SPI1, SPI2, SPI3, SDMMC},
     prelude::*,
     serial::{self, Config, Serial, Tx, Rx},
     watchdog::IndependentWatchdog,
+    spi::Spi,
 };
 
-use wurth_calypso::{
-    Calypso
-};
-
+const FILE_TO_WRITE: &str = "LOGS.TXT";
 const DEVICE: device::Device = device::Device::SteeringWheel;
 const SYSCLK: u32 = 80_000_000;
+
+/// SPI mode
+pub const MODE: Mode = Mode {
+    phase: Phase::CaptureOnFirstTransition,
+    polarity: Polarity::IdleLow,
+};
+
+use core::marker::PhantomData;
+
+struct TimeSink {
+    _marker: PhantomData<*const ()>,
+}
+
+impl TimeSink {
+    fn new() -> Self {
+        TimeSink { _marker: PhantomData}
+    }
+}
+
+impl TimeSource for TimeSink {
+    fn get_timestamp(&self) -> Timestamp {
+        Timestamp{
+            year_since_1970: 0,
+            zero_indexed_month: 0,
+            zero_indexed_day: 0,
+            hours: 0,
+            minutes: 0,
+            seconds: 0,
+        }
+    }
+}
+// This is for formatting strings
+pub mod write_to {
+    use core::cmp::min;
+    use core::fmt;
+
+    pub struct WriteTo<'a> {
+        buffer: &'a mut [u8],
+        // on write error (i.e. not enough space in buffer) this grows beyond
+        // `buffer.len()`.
+        used: usize,
+    }
+
+    impl<'a> WriteTo<'a> {
+        pub fn new(buffer: &'a mut [u8]) -> Self {
+            WriteTo { buffer, used: 0 }
+        }
+
+        pub fn as_str(self) -> Option<&'a str> {
+            if self.used <= self.buffer.len() {
+                // only successful concats of str - must be a valid str.
+                use core::str::from_utf8_unchecked;
+                Some(unsafe { from_utf8_unchecked(&self.buffer[..self.used]) })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl<'a> fmt::Write for WriteTo<'a> {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            if self.used > self.buffer.len() {
+                return Err(fmt::Error);
+            }
+            let remaining_buf = &mut self.buffer[self.used..];
+            let raw_s = s.as_bytes();
+            let write_num = min(raw_s.len(), remaining_buf.len());
+            remaining_buf[..write_num].copy_from_slice(&raw_s[..write_num]);
+            self.used += raw_s.len();
+            if write_num < raw_s.len() {
+                Err(fmt::Error)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    pub fn show<'a>(buffer: &'a mut [u8], args: fmt::Arguments) -> Result<&'a str, fmt::Error> {
+        let mut w = WriteTo::new(buffer);
+        fmt::write(&mut w, args)?;
+        w.as_str().ok_or(fmt::Error)
+    }
+}
+
 
 #[rtic::app(device = stm32l4xx_hal::pac, dispatchers = [SPI1, SPI2, SPI3, QUADSPI])]
 mod app {
@@ -62,27 +168,37 @@ mod app {
         can: bxcan::Can<
             Can<
                 CAN1,
-                (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>),
+                (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>),
             >,
         >,
-        // uart: Serial<
-        //     USART1,
-        //     (PA9<Alternate<PushPull, 7>>, PA10<Alternate<PushPull, 7>>),
-        // >,
-        tx: Tx<USART2>,
-        // rx: Rx<USART1>,
+        frame_reader: FrameReader<Box<SerialDMAPool>, RxDma<Rx<USART2>, dma::dma1::C6>, 32>,
+        frame_sender: FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>,
+        send_ready: bool,
+        delay: DelayCM,
+        can_packet_buf: [u8; 128]
     }
 
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
         status_led: PB13<Output<PushPull>>,
-        circ_buffer: CircBuffer<[u8; 32], RxDma<Rx<USART2>, dma::dma1::C6>>
+        
+        spi_dev: SdCard<
+                Spi<SPI1, (
+                    PA5<Alternate<PushPull, 5>>, PA6<Alternate<PushPull, 5>>, PA7<Alternate<PushPull, 5>>
+                )>,
+                PA4<Output<OpenDrain>>,
+                DelayCM>,
     }
 
     #[init]
     fn init(mut cx: init::Context) -> (Shared, Local, init::Monotonics) {
         defmt::trace!("task: init");
+
+        static mut MEMORY: [u8; 1024] = [0; 1024];
+
+        // increase the capacity of the pool by ~8 blocks
+        unsafe {SerialDMAPool::grow(&mut MEMORY)};
 
         // peripherals
         let mut flash = cx.device.FLASH.constrain();
@@ -90,6 +206,8 @@ mod app {
         let mut pwr = cx.device.PWR.constrain(&mut rcc.apb1r1);
         let mut gpioa = cx.device.GPIOA.split(&mut rcc.ahb2);
         let mut gpiob = cx.device.GPIOB.split(&mut rcc.ahb2);
+        let mut gpioc = cx.device.GPIOC.split(&mut rcc.ahb2);
+        let mut gpiod = cx.device.GPIOD.split(&mut rcc.ahb2);
 
         // configure system clock
         let clocks = rcc.cfgr.sysclk(80.MHz()).freeze(&mut flash.acr, &mut pwr);
@@ -102,6 +220,10 @@ mod app {
             clocks.sysclk().to_Hz(),
         );
 
+        // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);        
+        let mut delay = DelayCM::new(clocks);
+        // delay.delay_ms(500_u32);
+
         // configure status led
         let status_led = gpiob
             .pb13
@@ -109,15 +231,26 @@ mod app {
 
         // configure can bus
         let can = {
-            let rx = gpioa.pa11.into_alternate(
-                &mut gpioa.moder,
-                &mut gpioa.otyper,
-                &mut gpioa.afrh,
+            // let rx = gpioa.pa11.into_alternate(
+            //     &mut gpioa.moder,
+            //     &mut gpioa.otyper,
+            //     &mut gpioa.afrh,
+            // );
+            // let tx = gpioa.pa12.into_alternate(
+            //     &mut gpioa.moder,
+            //     &mut gpioa.otyper,
+            //     &mut gpioa.afrh,
+            // );
+
+            let rx = gpiob.pb8.into_alternate(
+                &mut gpiob.moder,
+                &mut gpiob.otyper,
+                &mut gpiob.afrh,
             );
-            let tx = gpioa.pa12.into_alternate(
-                &mut gpioa.moder,
-                &mut gpioa.otyper,
-                &mut gpioa.afrh,
+            let tx = gpiob.pb9.into_alternate(
+                &mut gpiob.moder,
+                &mut gpiob.otyper,
+                &mut gpiob.afrh,
             );
 
             let can = bxcan::Can::builder(Can::new(
@@ -146,6 +279,35 @@ mod app {
             can
         };
 
+        // Configure SPI
+        let sck = gpioa
+            .pa5
+            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+
+        let miso = gpioa
+            .pa6
+            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+
+        let mosi = gpioa
+            .pa7
+            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+
+        let spi = Spi::spi1(
+            cx.device.SPI1,
+            (sck, miso, mosi),
+            MODE,
+            16.MHz(),
+            clocks,
+            &mut rcc.apb2
+        );
+
+        let spi_cs_pin = gpioa
+            .pa4
+            .into_open_drain_output(&mut gpioa.moder, &mut gpioa.otyper);
+
+        let spi_dev = SdCard::new(spi, spi_cs_pin, delay);
+
+        // Configure UART
         let mut uart = {
             let tx = gpioa.pa2.into_alternate(
                 &mut gpioa.moder,
@@ -171,7 +333,8 @@ mod app {
             )
         };
 
-        uart.listen(serial::Event::Rxne);
+        uart.listen(serial::Event::CharacterMatch);
+        let (mut tx, mut rx) = uart.split();
 
         let watchdog = {
             let mut wd = IndependentWatchdog::new(cx.device.IWDG);
@@ -181,26 +344,49 @@ mod app {
             wd
         };
 
-        let (tx, rx) = uart.split();
-
         let channels = cx.device.DMA1.split(&mut rcc.ahb1);
-        let buf = singleton!(: [u8; 32] = [0; 32]).unwrap();
-        let circ_buffer = rx.with_dma(channels.6).circ_read(buf);
+        let mut dma_ch6 = channels.6;
+        let mut dma_ch7 = channels.7;
+        dma_ch6.listen(dma::Event::TransferComplete);
+        dma_ch7.listen(dma::Event::TransferComplete);
+
+        // Serial frame reader (DMA based), give it a buffer to start reading into
+        let frame_reader = if let Some(dma_buf) = SerialDMAPool::alloc() {
+            // Set up the first reader frame
+            let dma_buf = dma_buf.init(DMAFrame::new());
+            rx.with_dma(dma_ch6).frame_reader(dma_buf)
+        } else {
+            unreachable!()
+        };
+
+        let mut send_ready = true;
+        // Serial frame sender (DMA based)
+        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 32> = tx.with_dma(dma_ch7).frame_sender();
+
+        let can_packet_buf = [0u8; 128];
+        // Send initial packet to calypso to get it into AT command mode
+        // The calypso will send an error message back which can be ignored
+        send_frame(b"AT+test\r\n", &mut send_ready, &mut frame_sender);
 
         // start main loop
         run::spawn().unwrap();
-        calypso_comms::spawn().unwrap();
+        // wait for bit for calypso to boot up
+        // write_dma_frames::spawn_after(Duration::millis(2000)).unwrap();
         
         (
             Shared { 
                 can,
-                tx,
-                // rx
+                frame_reader,
+                frame_sender,
+                send_ready,
+                delay,
+                can_packet_buf
             },
             Local {
                 watchdog,
                 status_led,
-                circ_buffer
+                spi_dev,
+                
             },
             init::Monotonics(mono),
         )
@@ -215,41 +401,163 @@ mod app {
         run::spawn_after(Duration::millis(10)).unwrap();
     }
 
-    #[task(priority = 1, shared = [tx])]
-    fn calypso_comms(mut cx: calypso_comms::Context) {
-        let mut buffer = [0; 128];
-
-        let command = CommandBuilder::create_execute(&mut buffer, true)
-            .named("+test")
-            .finish()
-            .unwrap();
-
-        defmt::debug!("Writing {:?}", core::str::from_utf8(command).unwrap());
-
-        cx.shared.tx.lock(|tx| {
-            let _ = command
-                .iter()
-                .map(|c| nb::block!(tx.write(*c)))
-                .last();
-        });
-
-        calypso_comms::spawn_after(Duration::millis(2000)).unwrap();
+    /// This task handles the character match interrupt at required by the `FrameReader`
+    #[task(binds = USART2, shared = [frame_reader, frame_sender, send_ready])]
+    fn serial_isr(mut cx: serial_isr::Context) {
+        // Check for character match
+        cx.shared.frame_reader.lock(|fr| {
+            if fr.check_character_match(true) {
+                if let Some(dma_buf) = SerialDMAPool::alloc() {
+                    let dma_buf = dma_buf.init(DMAFrame::new());
+                    let buf = fr.character_match_interrupt(dma_buf);
+    
+                    let res = core::str::from_utf8(buf.read()).unwrap();
+                    defmt::debug!("RESPONSE: {:?}", res);
+                    // TODO this will be instructions given from Profinity
+                    // Need to then forward the comms to the relevant device
+                    cx.shared.send_ready.lock(|sr| {
+                        *sr = true;
+                    });
+                }
+            }
+        });        
     }
 
-    #[task(binds = USART2, local = [circ_buffer])]
-    fn uart_read(cx: uart_read::Context) {
-        let mut rx_buf = [0; 32];
+    /// This task handles the RX transfer complete interrupt at required by the `FrameReader`
+    /// In this case we are discarding if a frame gets full as no character match was received
+    #[task(binds = DMA1_CH6, shared = [frame_reader])]
+    fn serial_rx_dma_isr(mut cx: serial_rx_dma_isr::Context) {
+        if let Some(dma_buf) = SerialDMAPool::alloc() {
+            let dma_buf = dma_buf.init(DMAFrame::new());
 
-        let rx_res = cx.local.circ_buffer.read(&mut rx_buf);
-        match rx_res {
-            Err(_) => (),
-            Ok(rx_len) => {
-                defmt::debug!("{:?}", core::str::from_utf8(&rx_buf[..rx_len]).unwrap());
-                // TODO for parsing AT commands
-                // let a = CommandParser::parse(&rx_buf).finish().unwrap();
-                // defmt::debug!("{:?}", a);
+            // Erroneous packet as it did not fit in a buffer, throw away the buffer
+            cx.shared.frame_reader.lock(|fr| {
+                let buf = fr.transfer_complete_interrupt(dma_buf);
+                let res = core::str::from_utf8(buf.read()).unwrap();
+                defmt::debug!("Discarding: {:?}", res);
+            });
+        }
+    }
+
+    // This task handles the TX transfer complete interrupt at required by the `FrameSender`
+    #[task(binds = DMA1_CH7, shared = [frame_sender, send_ready])]
+    fn serial_tx_dma_isr(mut cx: serial_tx_dma_isr::Context) {
+        cx.shared.frame_sender.lock(|fs| {
+            if let Some(buf) = fs.transfer_complete_interrupt() {
+                let res = core::str::from_utf8(buf.read()).unwrap();
+                defmt::debug!("Sent: {:?}", res);
+                // Frame sent, drop the buffer to return it too the pool
+                cx.shared.send_ready.lock(|sr| {
+                    *sr = true;
+                });
             }
-        }        
+        });
+    }
+
+    #[task(shared = [frame_sender, send_ready, can_packet_buf])]
+    fn calypso_write(mut cx: calypso_write::Context) {
+        // let mut buffer = [0; 128];
+        // TODO consider using at commands crate, but this does not append
+        // string parameters properly
+        // let cmd: &[u8; 21] = b"AT+send=0,0,5,hello\r\n";
+        // let cmd = write_to::show(
+        //     &mut buf,
+        //     format_args!("AT+{:?}{:?}\r\n", id, frame),
+        // ).unwrap();
+
+        cx.shared.send_ready.lock(|sr| {
+            cx.shared.frame_sender.lock(|fs| {
+                cx.shared.can_packet_buf.lock(|buf| {
+                    defmt::debug!("Writing {:?}", core::str::from_utf8(buf).unwrap());
+                    send_frame(buf, sr, fs);
+                });
+            });
+        });
+    }
+
+    #[task(shared = [frame_sender, send_ready])]
+    fn calypso_read(mut cx: calypso_read::Context) {
+        // let mut buffer = [0; 128];
+        // TODO consider using at commands crate, but this does not append
+        // string parameters properly
+        let cmd = b"AT+recv=1,0,32\r\n";
+
+        defmt::debug!("Writing {:?}", core::str::from_utf8(cmd).unwrap());
+
+        cx.shared.send_ready.lock(|sr| {
+            cx.shared.frame_sender.lock(|fs| {
+                send_frame(cmd, sr, fs);
+                // We should receive OK followed by +recv:1,0,32,data, followed by another OK in UART
+            });
+        });
+
+        calypso_read::spawn_after(Duration::millis(2000)).unwrap();
+    }
+
+    /// Triggers on RX mailbox event.
+    #[task(priority = 1, shared = [can], binds = CAN1_RX0)]
+    fn can_rx0_pending(_: can_rx0_pending::Context) {
+        defmt::trace!("task: can rx0 pending");
+
+        can_receive::spawn().unwrap();
+    }
+
+    /// Triggers on RX mailbox event.
+    #[task(priority = 1, shared = [can], binds = CAN1_RX1)]
+    fn can_rx1_pending(_: can_rx1_pending::Context) {
+        defmt::trace!("task: can rx1 pending");
+
+        can_receive::spawn().unwrap();
+    }
+
+    #[task(priority = 2, shared = [can, can_packet_buf])]
+    fn can_receive(mut cx: can_receive::Context) {
+        defmt::trace!("task: can receive");
+        
+        cx.shared.can.lock(|can| loop {
+            let frame = match can.receive() {
+                Ok(frame) => frame,
+                Err(nb::Error::WouldBlock) => break, // done
+                Err(nb::Error::Other(_)) => continue, // go to next frame
+            };
+
+            let id = match frame.id() {
+                Id::Standard(_) => {
+                    continue; // go to next frame
+                }
+                Id::Extended(id) => id,
+            };
+            let id: j1939::ExtendedId = id.into();
+
+            match id.pgn {
+                Pgn::Destination(pgn) => {
+                    // Serialize can frame and send over Wifi
+                    cx.shared.can_packet_buf.lock(|buf| {
+                        let _can_packet = write_to::show(
+                            buf,
+                            // hardcode length for now but this may need to be calculated
+                            format_args!("AT+send=0,0,23{:?}{:?}\r\n", id.to_bits(), frame.data().unwrap()),
+                        ).unwrap();
+                        calypso_write::spawn().unwrap();
+                    });
+                },
+                _ => {} // ignore broadcast messages
+            }
+        });
+    }
+
+    fn send_frame(data: &[u8], send_ready: &mut bool, frame_sender: &mut FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>) {
+        // TODO there is probably a better way to handle this but I am too dum to figure it out rn
+        defmt::debug!("waiting to send {:?}", core::str::from_utf8(data).unwrap());
+        while !*send_ready { }
+        
+        *send_ready = false;
+
+        if let Some(dma_buf) = SerialDMAPool::alloc() {
+            let mut dma_buf = dma_buf.init(DMAFrame::new());
+            let _buf_size = dma_buf.write_slice(data);
+            frame_sender.send(dma_buf).unwrap();
+        }
     }
 }
 
