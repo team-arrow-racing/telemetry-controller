@@ -567,6 +567,7 @@ mod app {
         });
     }
 
+    #[allow(clippy::while_immutable_condition)]
     fn send_frame(
         data: &[u8],
         send_ready: &mut bool,
