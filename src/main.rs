@@ -546,21 +546,21 @@ mod app {
             let id: j1939::ExtendedId = id.into();
 
             if let Pgn::Destination(_pgn) = id.pgn {
-                    // Serialize can frame and send over Wifi
-                    cx.shared.can_packet_buf.lock(|buf| {
-                        let _can_packet = write_to::show(
-                            buf,
-                            // hardcode length for now but this may need to be calculated
-                            format_args!(
-                                "AT+send=0,0,23{:?}{:?}\r\n",
-                                id.to_bits(),
-                                frame.data().unwrap()
-                            ),
-                        )
-                        .unwrap();
-                        calypso_write::spawn().unwrap();
-                    });
-                }
+                // Serialize can frame and send over Wifi
+                cx.shared.can_packet_buf.lock(|buf| {
+                    let _can_packet = write_to::show(
+                        buf,
+                        // hardcode length for now but this may need to be calculated
+                        format_args!(
+                            "AT+send=0,0,23{:?}{:?}\r\n",
+                            id.to_bits(),
+                            frame.data().unwrap()
+                        ),
+                    )
+                    .unwrap();
+                    calypso_write::spawn().unwrap();
+                });
+            }
         });
     }
 
