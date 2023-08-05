@@ -3,6 +3,12 @@
 version = 3
 
 [[package]]
+name = "at-commands"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4a8646d185c65bef10ce383678ec7a28ef0293f61bbd030d2fc1deffcd3e18b4"
+
+[[package]]
 name = "atomic-polyfill"
 version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -222,6 +228,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "embedded-alloc"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8931e47e33c5d3194fbcf9cc82df0919193bd2fa40008f388eb1d28fd9c9ea6b"
+dependencies = [
+ "critical-section",
+ "linked_list_allocator",
+]
+
+[[package]]
 name = "embedded-dma"
 version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -238,6 +254,17 @@ checksum = "35949884794ad573cf46071e41c9b60efb0cb311e3ca01f7af807af1debc66ff"
 dependencies = [
  "nb 0.1.3",
  "void",
+]
+
+[[package]]
+name = "embedded-sdmmc"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f4d14180a76a8af24a45a0e1a4f9c97491b05a3b962d59d5e4ce0e6ab103736"
+dependencies = [
+ "byteorder",
+ "embedded-hal",
+ "log",
 ]
 
 [[package]]
@@ -302,10 +329,16 @@ dependencies = [
 [[package]]
 name = "j1939"
 version = "0.1.1"
-source = "git+https://gitlab.com/team-arrow-racing/sae-j1939#e1e5acc9e292af12cd2340707130a815dead47cf"
+source = "git+https://github.com/team-arrow-racing/sae-j1939-rs#2bde0d0e63c55e79918fa39a9cec64a749bc3f82"
 dependencies = [
  "bxcan",
 ]
+
+[[package]]
+name = "linked_list_allocator"
+version = "0.10.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9afa463f5405ee81cdb9cc2baf37e08ec7e4c8209442b5d72c04cfb2cd6e6286"
 
 [[package]]
 name = "lock_api"
@@ -316,6 +349,12 @@ dependencies = [
  "autocfg",
  "scopeguard",
 ]
+
+[[package]]
+name = "log"
+version = "0.4.19"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b06a4cde4c0f271a446782e3eff8de789548ce57dbc8eca9292c27f4a42004b4"
 
 [[package]]
 name = "nb"
@@ -489,15 +528,13 @@ checksum = "388a1df253eca08550bef6c72392cfe7c30914bf41df5269b68cbd6ff8f570a3"
 [[package]]
 name = "solar-car"
 version = "0.1.1"
-source = "git+https://gitlab.com/team-arrow-racing/arrow-3/solar-car#9e41b0eb8020a7906a13df27a9881f611f2cd5e7"
+source = "git+https://github.com/team-arrow-racing/solar-car-common#0e0995c4b127e770c2a2a71b47da66f315151dd6"
 dependencies = [
  "bitflags",
  "bxcan",
  "defmt",
- "heapless",
  "j1939",
  "packed_struct",
- "stm32l4xx-hal",
 ]
 
 [[package]]
@@ -578,6 +615,7 @@ checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
 name = "telemetry-transponder"
 version = "0.1.0"
 dependencies = [
+ "at-commands",
  "bitflags",
  "bxcan",
  "cortex-m",
@@ -587,7 +625,9 @@ dependencies = [
  "defmt-rtt",
  "dwt-systick-monotonic",
  "elmar-mppt",
+ "embedded-alloc",
  "embedded-hal",
+ "embedded-sdmmc",
  "heapless",
  "nb 1.1.0",
  "panic-probe",
@@ -652,7 +692,7 @@ dependencies = [
 [[package]]
 name = "wurth-calypso"
 version = "0.1.0"
-source = "git+https://gitlab.com/team-arrow-racing/wurth-calypso#08deec3f891201a492cf4af1ccb8279b47cc5ca5"
+source = "git+https://github.com/team-arrow-racing/wurth-calypso-rs#197ffaccfea08cc91cb78b4c371f4421a14d5d82"
 dependencies = [
  "embedded-hal",
  "fugit",

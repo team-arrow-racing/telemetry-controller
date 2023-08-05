@@ -22,7 +22,6 @@ use panic_probe as _;
 use at_commands::builder::CommandBuilder;
 use at_commands::parser::CommandParser;
 
-
 use heapless::{
     pool,
     pool::singleton::{Box, Pool},
@@ -38,13 +37,9 @@ use bxcan::{self, filter::Mask32, Frame, Id, Interrupts};
 
 use dwt_systick_monotonic::{fugit, DwtSystick};
 
-use embedded_hal::{
-    spi::{Mode, Phase, Polarity}
-};
+use embedded_hal::spi::{Mode, Phase, Polarity};
 
-use embedded_sdmmc::{
-    TimeSource, Timestamp, SdCard,
-};
+use embedded_sdmmc::{SdCard, TimeSource, Timestamp};
 
 use solar_car::{
     com, device, j1939,
@@ -52,16 +47,19 @@ use solar_car::{
 };
 use stm32l4xx_hal::{
     can::Can,
-    device::CAN1,
     delay::DelayCM,
-    dma::{self, RxDma, TxDma, DMAFrame, FrameReader, FrameSender},
+    device::CAN1,
+    dma::{self, DMAFrame, FrameReader, FrameSender, RxDma, TxDma},
     flash::FlashExt,
-    gpio::{Alternate, OpenDrain, Output, PushPull, PA4, PA5, PA6, PA7, PA11, PA12, PB8, PB9, PB13, PC8, PC9, PC12, PD2, Speed},
-    pac::{USART2, SPI1, SPI2, SPI3, SDMMC},
+    gpio::{
+        Alternate, OpenDrain, Output, PushPull, Speed, PA11, PA12, PA4, PA5,
+        PA6, PA7, PB13, PB8, PB9, PC12, PC8, PC9, PD2,
+    },
+    pac::{SDMMC, SPI1, SPI2, SPI3, USART2},
     prelude::*,
-    serial::{self, Config, Serial, Tx, Rx},
-    watchdog::IndependentWatchdog,
+    serial::{self, Config, Rx, Serial, Tx},
     spi::Spi,
+    watchdog::IndependentWatchdog,
 };
 
 const FILE_TO_WRITE: &str = "LOGS.TXT";
@@ -82,13 +80,15 @@ struct TimeSink {
 
 impl TimeSink {
     fn new() -> Self {
-        TimeSink { _marker: PhantomData}
+        TimeSink {
+            _marker: PhantomData,
+        }
     }
 }
 
 impl TimeSource for TimeSink {
     fn get_timestamp(&self) -> Timestamp {
-        Timestamp{
+        Timestamp {
             year_since_1970: 0,
             zero_indexed_month: 0,
             zero_indexed_day: 0,
@@ -144,13 +144,15 @@ pub mod write_to {
         }
     }
 
-    pub fn show<'a>(buffer: &'a mut [u8], args: fmt::Arguments) -> Result<&'a str, fmt::Error> {
+    pub fn show<'a>(
+        buffer: &'a mut [u8],
+        args: fmt::Arguments,
+    ) -> Result<&'a str, fmt::Error> {
         let mut w = WriteTo::new(buffer);
         fmt::write(&mut w, args)?;
         w.as_str().ok_or(fmt::Error)
     }
 }
-
 
 #[rtic::app(device = stm32l4xx_hal::pac, dispatchers = [SPI1, SPI2, SPI3, QUADSPI])]
 mod app {
@@ -171,24 +173,38 @@ mod app {
                 (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>),
             >,
         >,
-        frame_reader: FrameReader<Box<SerialDMAPool>, RxDma<Rx<USART2>, dma::dma1::C6>, 32>,
-        frame_sender: FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>,
+        frame_reader: FrameReader<
+            Box<SerialDMAPool>,
+            RxDma<Rx<USART2>, dma::dma1::C6>,
+            32,
+        >,
+        frame_sender: FrameSender<
+            Box<SerialDMAPool>,
+            TxDma<Tx<USART2>, dma::dma1::C7>,
+            32,
+        >,
         send_ready: bool,
         delay: DelayCM,
-        can_packet_buf: [u8; 128]
+        can_packet_buf: [u8; 128],
     }
 
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
         status_led: PB13<Output<PushPull>>,
-        
+
         spi_dev: SdCard<
-                Spi<SPI1, (
-                    PA5<Alternate<PushPull, 5>>, PA6<Alternate<PushPull, 5>>, PA7<Alternate<PushPull, 5>>
-                )>,
-                PA4<Output<OpenDrain>>,
-                DelayCM>,
+            Spi<
+                SPI1,
+                (
+                    PA5<Alternate<PushPull, 5>>,
+                    PA6<Alternate<PushPull, 5>>,
+                    PA7<Alternate<PushPull, 5>>,
+                ),
+            >,
+            PA4<Output<OpenDrain>>,
+            DelayCM,
+        >,
     }
 
     #[init]
@@ -198,7 +214,7 @@ mod app {
         static mut MEMORY: [u8; 1024] = [0; 1024];
 
         // increase the capacity of the pool by ~8 blocks
-        unsafe {SerialDMAPool::grow(&mut MEMORY)};
+        unsafe { SerialDMAPool::grow(&mut MEMORY) };
 
         // peripherals
         let mut flash = cx.device.FLASH.constrain();
@@ -220,7 +236,7 @@ mod app {
             clocks.sysclk().to_Hz(),
         );
 
-        // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);        
+        // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);
         let mut delay = DelayCM::new(clocks);
         // delay.delay_ms(500_u32);
 
@@ -280,17 +296,23 @@ mod app {
         };
 
         // Configure SPI
-        let sck = gpioa
-            .pa5
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let sck = gpioa.pa5.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
-        let miso = gpioa
-            .pa6
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let miso = gpioa.pa6.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
-        let mosi = gpioa
-            .pa7
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let mosi = gpioa.pa7.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
         let spi = Spi::spi1(
             cx.device.SPI1,
@@ -298,7 +320,7 @@ mod app {
             MODE,
             16.MHz(),
             clocks,
-            &mut rcc.apb2
+            &mut rcc.apb2,
         );
 
         let spi_cs_pin = gpioa
@@ -361,7 +383,8 @@ mod app {
 
         let mut send_ready = true;
         // Serial frame sender (DMA based)
-        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 32> = tx.with_dma(dma_ch7).frame_sender();
+        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 32> =
+            tx.with_dma(dma_ch7).frame_sender();
 
         let can_packet_buf = [0u8; 128];
         // Send initial packet to calypso to get it into AT command mode
@@ -372,21 +395,20 @@ mod app {
         run::spawn().unwrap();
         // wait for bit for calypso to boot up
         // write_dma_frames::spawn_after(Duration::millis(2000)).unwrap();
-        
+
         (
-            Shared { 
+            Shared {
                 can,
                 frame_reader,
                 frame_sender,
                 send_ready,
                 delay,
-                can_packet_buf
+                can_packet_buf,
             },
             Local {
                 watchdog,
                 status_led,
                 spi_dev,
-                
             },
             init::Monotonics(mono),
         )
@@ -410,7 +432,7 @@ mod app {
                 if let Some(dma_buf) = SerialDMAPool::alloc() {
                     let dma_buf = dma_buf.init(DMAFrame::new());
                     let buf = fr.character_match_interrupt(dma_buf);
-    
+
                     let res = core::str::from_utf8(buf.read()).unwrap();
                     defmt::debug!("RESPONSE: {:?}", res);
                     // TODO this will be instructions given from Profinity
@@ -420,7 +442,7 @@ mod app {
                     });
                 }
             }
-        });        
+        });
     }
 
     /// This task handles the RX transfer complete interrupt at required by the `FrameReader`
@@ -468,7 +490,10 @@ mod app {
         cx.shared.send_ready.lock(|sr| {
             cx.shared.frame_sender.lock(|fs| {
                 cx.shared.can_packet_buf.lock(|buf| {
-                    defmt::debug!("Writing {:?}", core::str::from_utf8(buf).unwrap());
+                    defmt::debug!(
+                        "Writing {:?}",
+                        core::str::from_utf8(buf).unwrap()
+                    );
                     send_frame(buf, sr, fs);
                 });
             });
@@ -513,7 +538,7 @@ mod app {
     #[task(priority = 2, shared = [can, can_packet_buf])]
     fn can_receive(mut cx: can_receive::Context) {
         defmt::trace!("task: can receive");
-        
+
         cx.shared.can.lock(|can| loop {
             let frame = match can.receive() {
                 Ok(frame) => frame,
@@ -536,21 +561,37 @@ mod app {
                         let _can_packet = write_to::show(
                             buf,
                             // hardcode length for now but this may need to be calculated
-                            format_args!("AT+send=0,0,23{:?}{:?}\r\n", id.to_bits(), frame.data().unwrap()),
-                        ).unwrap();
+                            format_args!(
+                                "AT+send=0,0,23{:?}{:?}\r\n",
+                                id.to_bits(),
+                                frame.data().unwrap()
+                            ),
+                        )
+                        .unwrap();
                         calypso_write::spawn().unwrap();
                     });
-                },
+                }
                 _ => {} // ignore broadcast messages
             }
         });
     }
 
-    fn send_frame(data: &[u8], send_ready: &mut bool, frame_sender: &mut FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>) {
+    fn send_frame(
+        data: &[u8],
+        send_ready: &mut bool,
+        frame_sender: &mut FrameSender<
+            Box<SerialDMAPool>,
+            TxDma<Tx<USART2>, dma::dma1::C7>,
+            32,
+        >,
+    ) {
         // TODO there is probably a better way to handle this but I am too dum to figure it out rn
-        defmt::debug!("waiting to send {:?}", core::str::from_utf8(data).unwrap());
-        while !*send_ready { }
-        
+        defmt::debug!(
+            "waiting to send {:?}",
+            core::str::from_utf8(data).unwrap()
+        );
+        while !*send_ready {}
+
         *send_ready = false;
 
         if let Some(dma_buf) = SerialDMAPool::alloc() {
