@@ -165,14 +165,11 @@ mod app {
     pub type Duration = fugit::TimerDuration<u64, SYSCLK>;
     pub type Instant = fugit::TimerInstant<u64, SYSCLK>;
 
+    type Can1Pins = (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>);
+
     #[shared]
     struct Shared {
-        can: bxcan::Can<
-            Can<
-                CAN1,
-                (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>),
-            >,
-        >,
+        can: bxcan::Can<Can<CAN1, Can1Pins>>,
         frame_reader: FrameReader<
             Box<SerialDMAPool>,
             RxDma<Rx<USART2>, dma::dma1::C6>,
@@ -188,23 +185,17 @@ mod app {
         can_packet_buf: [u8; 128],
     }
 
+    type Spi1Pins = (
+        PA5<Alternate<PushPull, 5>>,
+        PA6<Alternate<PushPull, 5>>,
+        PA7<Alternate<PushPull, 5>>,
+    );
+
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
         status_led: PB13<Output<PushPull>>,
-
-        spi_dev: SdCard<
-            Spi<
-                SPI1,
-                (
-                    PA5<Alternate<PushPull, 5>>,
-                    PA6<Alternate<PushPull, 5>>,
-                    PA7<Alternate<PushPull, 5>>,
-                ),
-            >,
-            PA4<Output<OpenDrain>>,
-            DelayCM,
-        >,
+        spi_dev: SdCard<Spi<SPI1, Spi1Pins>, PA4<Output<OpenDrain>>, DelayCM>,
     }
 
     #[init]
