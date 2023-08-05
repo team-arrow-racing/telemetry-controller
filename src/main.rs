@@ -2,14 +2,14 @@
 //!
 //! # Task priority assignment
 //!
-//! It would be more idomatic to have these assigned in a enum or some constants
+//! It would be more idiomatic to have these assigned in a enum or some constants
 //! but RTIC doesn't yet support variables (static or otherwise) in task
 //! definitions.
 //!
 //! | Priority | Use |
 //! | --- | --- |
 //! | 0 | `idle` task and background tasks. |
-//! | 1 (default) | General and asychronous tasks. |
+//! | 1 (default) | General and asynchronous tasks. |
 //! | 2 | Synchronous comms tasks. |
 //! | 3 | System critical tasks. |
 
