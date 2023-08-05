@@ -545,8 +545,7 @@ mod app {
             };
             let id: j1939::ExtendedId = id.into();
 
-            match id.pgn {
-                Pgn::Destination(pgn) => {
+            if let Pgn::Destination(_pgn) = id.pgn {
                     // Serialize can frame and send over Wifi
                     cx.shared.can_packet_buf.lock(|buf| {
                         let _can_packet = write_to::show(
@@ -562,8 +561,6 @@ mod app {
                         calypso_write::spawn().unwrap();
                     });
                 }
-                _ => {} // ignore broadcast messages
-            }
         });
     }
 
