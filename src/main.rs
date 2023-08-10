@@ -31,7 +31,7 @@ use heapless::{
 // The pool gives out `Box<DMAFrame>`s that can hold 8 bytes
 pool!(
     #[allow(non_upper_case_globals)]
-    SerialDMAPool: DMAFrame<32>
+    SerialDMAPool: DMAFrame<128>
 );
 
 use bxcan::{self, filter::Mask32, Frame, Id, Interrupts};
@@ -168,12 +168,11 @@ mod app {
         can: bxcan::Can<
             Can<
                 CAN1,
-                (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>),
+                (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>),
             >,
         >,
-        frame_reader: FrameReader<Box<SerialDMAPool>, RxDma<Rx<USART2>, dma::dma1::C6>, 32>,
-        frame_sender: FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>,
-        send_ready: bool,
+        frame_reader: FrameReader<Box<SerialDMAPool>, RxDma<Rx<USART2>, dma::dma1::C6>, 128>,
+        frame_sender: FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 128>,
         delay: DelayCM,
         can_packet_buf: [u8; 128]
     }
@@ -231,34 +230,36 @@ mod app {
 
         // configure can bus
         let can = {
-            // let rx = gpioa.pa11.into_alternate(
-            //     &mut gpioa.moder,
-            //     &mut gpioa.otyper,
-            //     &mut gpioa.afrh,
-            // );
-            // let tx = gpioa.pa12.into_alternate(
-            //     &mut gpioa.moder,
-            //     &mut gpioa.otyper,
-            //     &mut gpioa.afrh,
-            // );
+            let rx = gpioa.pa11.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
+            let tx = gpioa.pa12.into_alternate(
+                &mut gpioa.moder,
+                &mut gpioa.otyper,
+                &mut gpioa.afrh,
+            );
 
-            let rx = gpiob.pb8.into_alternate(
-                &mut gpiob.moder,
-                &mut gpiob.otyper,
-                &mut gpiob.afrh,
-            );
-            let tx = gpiob.pb9.into_alternate(
-                &mut gpiob.moder,
-                &mut gpiob.otyper,
-                &mut gpiob.afrh,
-            );
+            // Pin out for the actual board
+            // let rx = gpiob.pb8.into_alternate(
+            //     &mut gpiob.moder,
+            //     &mut gpiob.otyper,
+            //     &mut gpiob.afrh,
+            // );
+            // let tx = gpiob.pb9.into_alternate(
+            //     &mut gpiob.moder,
+            //     &mut gpiob.otyper,
+            //     &mut gpiob.afrh,
+            // );
 
             let can = bxcan::Can::builder(Can::new(
                 &mut rcc.apb1r1,
                 cx.device.CAN1,
                 (tx, rx),
             ))
-            .set_bit_timing(0x001c_0009); // 500kbit/s
+            .set_bit_timing(0x001c_0009)
+            .set_loopback(true); // 500kbit/s
 
             let mut can = can.enable();
 
@@ -359,17 +360,19 @@ mod app {
             unreachable!()
         };
 
-        let mut send_ready = true;
         // Serial frame sender (DMA based)
-        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 32> = tx.with_dma(dma_ch7).frame_sender();
+        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 128> = tx.with_dma(dma_ch7).frame_sender();
 
         let can_packet_buf = [0u8; 128];
         // Send initial packet to calypso to get it into AT command mode
         // The calypso will send an error message back which can be ignored
-        send_frame(b"AT+test\r\n", &mut send_ready, &mut frame_sender);
+        send_frame(b"AT+test\r\n", &mut frame_sender);
+        // delay.delay_ms(1000_u32);
+        // send_frame(b"AT+connect=0,INET,8888,192.168.1.168\r\n", &mut frame_sender);
 
         // start main loop
         run::spawn().unwrap();
+        demo_lighting::spawn_after(Duration::millis(1000)).unwrap();
         // wait for bit for calypso to boot up
         // write_dma_frames::spawn_after(Duration::millis(2000)).unwrap();
         
@@ -378,7 +381,6 @@ mod app {
                 can,
                 frame_reader,
                 frame_sender,
-                send_ready,
                 delay,
                 can_packet_buf
             },
@@ -402,7 +404,7 @@ mod app {
     }
 
     /// This task handles the character match interrupt at required by the `FrameReader`
-    #[task(binds = USART2, shared = [frame_reader, frame_sender, send_ready])]
+    #[task(binds = USART2, shared = [frame_reader, frame_sender])]
     fn serial_isr(mut cx: serial_isr::Context) {
         // Check for character match
         cx.shared.frame_reader.lock(|fr| {
@@ -411,13 +413,13 @@ mod app {
                     let dma_buf = dma_buf.init(DMAFrame::new());
                     let buf = fr.character_match_interrupt(dma_buf);
     
-                    let res = core::str::from_utf8(buf.read()).unwrap();
-                    defmt::debug!("RESPONSE: {:?}", res);
+                    // let res = core::str::from_utf8(buf.read()).unwrap();
+                    match core::str::from_utf8(buf.read()) {
+                        Ok(res) => defmt::debug!("RESPONSE: {:?}", res),
+                        _ => defmt::debug!("Pacnied")
+                    }
                     // TODO this will be instructions given from Profinity
                     // Need to then forward the comms to the relevant device
-                    cx.shared.send_ready.lock(|sr| {
-                        *sr = true;
-                    });
                 }
             }
         });        
@@ -440,21 +442,33 @@ mod app {
     }
 
     // This task handles the TX transfer complete interrupt at required by the `FrameSender`
-    #[task(binds = DMA1_CH7, shared = [frame_sender, send_ready])]
+    #[task(binds = DMA1_CH7, shared = [frame_sender])]
     fn serial_tx_dma_isr(mut cx: serial_tx_dma_isr::Context) {
         cx.shared.frame_sender.lock(|fs| {
             if let Some(buf) = fs.transfer_complete_interrupt() {
                 let res = core::str::from_utf8(buf.read()).unwrap();
                 defmt::debug!("Sent: {:?}", res);
                 // Frame sent, drop the buffer to return it too the pool
-                cx.shared.send_ready.lock(|sr| {
-                    *sr = true;
-                });
             }
         });
     }
 
-    #[task(shared = [frame_sender, send_ready, can_packet_buf])]
+    // Write a can frame to ourselves every second
+    #[task(priority = 1, shared = [can])]
+    fn demo_lighting(mut cx: demo_lighting::Context) {
+        defmt::trace!("task: writing a lighting frame");
+
+        let test_frame =
+            com::lighting::message(DEVICE, 12);
+        
+        cx.shared.can.lock(|can| {
+            let _ = can.transmit(&test_frame);
+        });
+
+        demo_lighting::spawn_after(Duration::millis(1000)).unwrap();
+    }
+
+    #[task(shared = [frame_sender, can_packet_buf])]
     fn calypso_write(mut cx: calypso_write::Context) {
         // let mut buffer = [0; 128];
         // TODO consider using at commands crate, but this does not append
@@ -465,17 +479,15 @@ mod app {
         //     format_args!("AT+{:?}{:?}\r\n", id, frame),
         // ).unwrap();
 
-        cx.shared.send_ready.lock(|sr| {
-            cx.shared.frame_sender.lock(|fs| {
-                cx.shared.can_packet_buf.lock(|buf| {
-                    defmt::debug!("Writing {:?}", core::str::from_utf8(buf).unwrap());
-                    send_frame(buf, sr, fs);
-                });
+        cx.shared.frame_sender.lock(|fs| {
+            cx.shared.can_packet_buf.lock(|buf| {
+                defmt::debug!("Writing {:?}", core::str::from_utf8(buf).unwrap());
+                send_frame(buf, fs);
             });
         });
     }
 
-    #[task(shared = [frame_sender, send_ready])]
+    #[task(shared = [frame_sender])]
     fn calypso_read(mut cx: calypso_read::Context) {
         // let mut buffer = [0; 128];
         // TODO consider using at commands crate, but this does not append
@@ -484,11 +496,9 @@ mod app {
 
         defmt::debug!("Writing {:?}", core::str::from_utf8(cmd).unwrap());
 
-        cx.shared.send_ready.lock(|sr| {
-            cx.shared.frame_sender.lock(|fs| {
-                send_frame(cmd, sr, fs);
-                // We should receive OK followed by +recv:1,0,32,data, followed by another OK in UART
-            });
+        cx.shared.frame_sender.lock(|fs| {
+            send_frame(cmd, fs);
+            // We should receive OK followed by +recv:1,0,{size},data, followed by another OK in UART
         });
 
         calypso_read::spawn_after(Duration::millis(2000)).unwrap();
@@ -531,12 +541,23 @@ mod app {
 
             match id.pgn {
                 Pgn::Destination(pgn) => {
+                    // temp format string to get length
+                    let mut tmp_buf = [0_u8; 128];
+                    let tmp_pack = write_to::show(
+                        &mut tmp_buf,
+                        format_args!("{:?}|{:?}", id.to_bits(), frame.data().unwrap()),
+                    ).unwrap();
+                    let len = tmp_pack.len();
+
+
                     // Serialize can frame and send over Wifi
                     cx.shared.can_packet_buf.lock(|buf| {
                         let _can_packet = write_to::show(
                             buf,
                             // hardcode length for now but this may need to be calculated
-                            format_args!("AT+send=0,0,23{:?}{:?}\r\n", id.to_bits(), frame.data().unwrap()),
+                            // for some reason, putting tmp_buf in here causes panic
+                            // so need to manually add id and frame data again...
+                            format_args!("AT+send=1,0,{},{:?}|{:?}\r\n", len, id.to_bits(), frame.data().unwrap()),
                         ).unwrap();
                         calypso_write::spawn().unwrap();
                     });
@@ -546,13 +567,7 @@ mod app {
         });
     }
 
-    fn send_frame(data: &[u8], send_ready: &mut bool, frame_sender: &mut FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 32>) {
-        // TODO there is probably a better way to handle this but I am too dum to figure it out rn
-        defmt::debug!("waiting to send {:?}", core::str::from_utf8(data).unwrap());
-        while !*send_ready { }
-        
-        *send_ready = false;
-
+    fn send_frame(data: &[u8], frame_sender: &mut FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 128>) {
         if let Some(dma_buf) = SerialDMAPool::alloc() {
             let mut dma_buf = dma_buf.init(DMAFrame::new());
             let _buf_size = dma_buf.write_slice(data);
