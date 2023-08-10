@@ -2,14 +2,14 @@
 //!
 //! # Task priority assignment
 //!
-//! It would be more idomatic to have these assigned in a enum or some constants
+//! It would be more idiomatic to have these assigned in a enum or some constants
 //! but RTIC doesn't yet support variables (static or otherwise) in task
 //! definitions.
 //!
 //! | Priority | Use |
 //! | --- | --- |
 //! | 0 | `idle` task and background tasks. |
-//! | 1 (default) | General and asychronous tasks. |
+//! | 1 (default) | General and asynchronous tasks. |
 //! | 2 | Synchronous comms tasks. |
 //! | 3 | System critical tasks. |
 
@@ -21,7 +21,6 @@ use panic_probe as _;
 
 use at_commands::builder::CommandBuilder;
 use at_commands::parser::CommandParser;
-
 
 use heapless::{
     pool,
@@ -38,13 +37,9 @@ use bxcan::{self, filter::Mask32, Frame, Id, Interrupts};
 
 use dwt_systick_monotonic::{fugit, DwtSystick};
 
-use embedded_hal::{
-    spi::{Mode, Phase, Polarity}
-};
+use embedded_hal::spi::{Mode, Phase, Polarity};
 
-use embedded_sdmmc::{
-    TimeSource, Timestamp, SdCard,
-};
+use embedded_sdmmc::{SdCard, TimeSource, Timestamp};
 
 use solar_car::{
     com, device, j1939,
@@ -52,16 +47,19 @@ use solar_car::{
 };
 use stm32l4xx_hal::{
     can::Can,
-    device::CAN1,
     delay::DelayCM,
-    dma::{self, RxDma, TxDma, DMAFrame, FrameReader, FrameSender},
+    device::CAN1,
+    dma::{self, DMAFrame, FrameReader, FrameSender, RxDma, TxDma},
     flash::FlashExt,
-    gpio::{Alternate, OpenDrain, Output, PushPull, PA4, PA5, PA6, PA7, PA11, PA12, PB8, PB9, PB13, PC8, PC9, PC12, PD2, Speed},
-    pac::{USART2, SPI1, SPI2, SPI3, SDMMC},
+    gpio::{
+        Alternate, OpenDrain, Output, PushPull, Speed, PA11, PA12, PA4, PA5,
+        PA6, PA7, PB13, PB8, PB9, PC12, PC8, PC9, PD2,
+    },
+    pac::{SDMMC, SPI1, SPI2, SPI3, USART2},
     prelude::*,
-    serial::{self, Config, Serial, Tx, Rx},
-    watchdog::IndependentWatchdog,
+    serial::{self, Config, Rx, Serial, Tx},
     spi::Spi,
+    watchdog::IndependentWatchdog,
 };
 
 const FILE_TO_WRITE: &str = "LOGS.TXT";
@@ -82,13 +80,15 @@ struct TimeSink {
 
 impl TimeSink {
     fn new() -> Self {
-        TimeSink { _marker: PhantomData}
+        TimeSink {
+            _marker: PhantomData,
+        }
     }
 }
 
 impl TimeSource for TimeSink {
     fn get_timestamp(&self) -> Timestamp {
-        Timestamp{
+        Timestamp {
             year_since_1970: 0,
             zero_indexed_month: 0,
             zero_indexed_day: 0,
@@ -144,13 +144,15 @@ pub mod write_to {
         }
     }
 
-    pub fn show<'a>(buffer: &'a mut [u8], args: fmt::Arguments) -> Result<&'a str, fmt::Error> {
+    pub fn show<'a>(
+        buffer: &'a mut [u8],
+        args: fmt::Arguments,
+    ) -> Result<&'a str, fmt::Error> {
         let mut w = WriteTo::new(buffer);
         fmt::write(&mut w, args)?;
         w.as_str().ok_or(fmt::Error)
     }
 }
-
 
 #[rtic::app(device = stm32l4xx_hal::pac, dispatchers = [SPI1, SPI2, SPI3, QUADSPI])]
 mod app {
@@ -163,31 +165,36 @@ mod app {
     pub type Duration = fugit::TimerDuration<u64, SYSCLK>;
     pub type Instant = fugit::TimerInstant<u64, SYSCLK>;
 
+    type Can1Pins = (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>);
+
     #[shared]
     struct Shared {
-        can: bxcan::Can<
-            Can<
-                CAN1,
-                (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>),
-            >,
+        can: bxcan::Can<Can<CAN1, Can1Pins>>,
+        frame_reader: FrameReader<
+            Box<SerialDMAPool>,
+            RxDma<Rx<USART2>, dma::dma1::C6>,
+            128,
         >,
-        frame_reader: FrameReader<Box<SerialDMAPool>, RxDma<Rx<USART2>, dma::dma1::C6>, 128>,
-        frame_sender: FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 128>,
+        frame_sender: FrameSender<
+            Box<SerialDMAPool>,
+            TxDma<Tx<USART2>, dma::dma1::C7>,
+            128,
+        >,
         delay: DelayCM,
-        can_packet_buf: [u8; 128]
+        can_packet_buf: [u8; 128],
     }
+
+    type Spi1Pins = (
+        PA5<Alternate<PushPull, 5>>,
+        PA6<Alternate<PushPull, 5>>,
+        PA7<Alternate<PushPull, 5>>,
+    );
 
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
         status_led: PB13<Output<PushPull>>,
-        
-        spi_dev: SdCard<
-                Spi<SPI1, (
-                    PA5<Alternate<PushPull, 5>>, PA6<Alternate<PushPull, 5>>, PA7<Alternate<PushPull, 5>>
-                )>,
-                PA4<Output<OpenDrain>>,
-                DelayCM>,
+        spi_dev: SdCard<Spi<SPI1, Spi1Pins>, PA4<Output<OpenDrain>>, DelayCM>,
     }
 
     #[init]
@@ -197,7 +204,7 @@ mod app {
         static mut MEMORY: [u8; 1024] = [0; 1024];
 
         // increase the capacity of the pool by ~8 blocks
-        unsafe {SerialDMAPool::grow(&mut MEMORY)};
+        unsafe { SerialDMAPool::grow(&mut MEMORY) };
 
         // peripherals
         let mut flash = cx.device.FLASH.constrain();
@@ -219,7 +226,7 @@ mod app {
             clocks.sysclk().to_Hz(),
         );
 
-        // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);        
+        // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);
         let mut delay = DelayCM::new(clocks);
         // delay.delay_ms(500_u32);
 
@@ -281,17 +288,23 @@ mod app {
         };
 
         // Configure SPI
-        let sck = gpioa
-            .pa5
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let sck = gpioa.pa5.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
-        let miso = gpioa
-            .pa6
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let miso = gpioa.pa6.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
-        let mosi = gpioa
-            .pa7
-            .into_alternate(&mut gpioa.moder, &mut gpioa.otyper, &mut gpioa.afrl);
+        let mosi = gpioa.pa7.into_alternate(
+            &mut gpioa.moder,
+            &mut gpioa.otyper,
+            &mut gpioa.afrl,
+        );
 
         let spi = Spi::spi1(
             cx.device.SPI1,
@@ -299,7 +312,7 @@ mod app {
             MODE,
             16.MHz(),
             clocks,
-            &mut rcc.apb2
+            &mut rcc.apb2,
         );
 
         let spi_cs_pin = gpioa
@@ -361,7 +374,8 @@ mod app {
         };
 
         // Serial frame sender (DMA based)
-        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 128> = tx.with_dma(dma_ch7).frame_sender();
+        let mut frame_sender: FrameSender<Box<SerialDMAPool>, _, 128> =
+            tx.with_dma(dma_ch7).frame_sender();
 
         let can_packet_buf = [0u8; 128];
         // Send initial packet to calypso to get it into AT command mode
@@ -375,20 +389,19 @@ mod app {
         demo_lighting::spawn_after(Duration::millis(1000)).unwrap();
         // wait for bit for calypso to boot up
         // write_dma_frames::spawn_after(Duration::millis(2000)).unwrap();
-        
+
         (
-            Shared { 
+            Shared {
                 can,
                 frame_reader,
                 frame_sender,
                 delay,
-                can_packet_buf
+                can_packet_buf,
             },
             Local {
                 watchdog,
                 status_led,
                 spi_dev,
-                
             },
             init::Monotonics(mono),
         )
@@ -412,17 +425,17 @@ mod app {
                 if let Some(dma_buf) = SerialDMAPool::alloc() {
                     let dma_buf = dma_buf.init(DMAFrame::new());
                     let buf = fr.character_match_interrupt(dma_buf);
-    
+
                     // let res = core::str::from_utf8(buf.read()).unwrap();
                     match core::str::from_utf8(buf.read()) {
                         Ok(res) => defmt::debug!("RESPONSE: {:?}", res),
-                        _ => defmt::debug!("Pacnied")
+                        _ => defmt::debug!("Pacnied"),
                     }
                     // TODO this will be instructions given from Profinity
                     // Need to then forward the comms to the relevant device
                 }
             }
-        });        
+        });
     }
 
     /// This task handles the RX transfer complete interrupt at required by the `FrameReader`
@@ -458,9 +471,8 @@ mod app {
     fn demo_lighting(mut cx: demo_lighting::Context) {
         defmt::trace!("task: writing a lighting frame");
 
-        let test_frame =
-            com::lighting::message(DEVICE, 12);
-        
+        let test_frame = com::lighting::message(DEVICE, 12);
+
         cx.shared.can.lock(|can| {
             let _ = can.transmit(&test_frame);
         });
@@ -481,7 +493,10 @@ mod app {
 
         cx.shared.frame_sender.lock(|fs| {
             cx.shared.can_packet_buf.lock(|buf| {
-                defmt::debug!("Writing {:?}", core::str::from_utf8(buf).unwrap());
+                defmt::debug!(
+                    "Writing {:?}",
+                    core::str::from_utf8(buf).unwrap()
+                );
                 send_frame(buf, fs);
             });
         });
@@ -523,51 +538,70 @@ mod app {
     #[task(priority = 2, shared = [can, can_packet_buf])]
     fn can_receive(mut cx: can_receive::Context) {
         defmt::trace!("task: can receive");
-        
-        cx.shared.can.lock(|can| loop {
-            let frame = match can.receive() {
-                Ok(frame) => frame,
-                Err(nb::Error::WouldBlock) => break, // done
-                Err(nb::Error::Other(_)) => continue, // go to next frame
-            };
 
-            let id = match frame.id() {
-                Id::Standard(_) => {
-                    continue; // go to next frame
+        cx.shared.can.lock(|can| {
+            loop {
+                let frame = match can.receive() {
+                    Ok(frame) => frame,
+                    Err(nb::Error::WouldBlock) => break, // done
+                    Err(nb::Error::Other(_)) => continue, // go to next frame
+                };
+
+                let id = match frame.id() {
+                    Id::Standard(_) => {
+                        continue; // go to next frame
+                    }
+                    Id::Extended(id) => id,
+                };
+                let id: j1939::ExtendedId = id.into();
+
+                match id.pgn {
+                    Pgn::Destination(pgn) => {
+                        // temp format string to get length
+                        let mut tmp_buf = [0_u8; 128];
+                        let tmp_pack = write_to::show(
+                            &mut tmp_buf,
+                            format_args!(
+                                "{:?}|{:?}",
+                                id.to_bits(),
+                                frame.data().unwrap()
+                            ),
+                        )
+                        .unwrap();
+                        let len = tmp_pack.len();
+
+                        // Serialize can frame and send over Wifi
+                        cx.shared.can_packet_buf.lock(|buf| {
+                            let _can_packet = write_to::show(
+                                buf,
+                                // hardcode length for now but this may need to be calculated
+                                // for some reason, putting tmp_buf in here causes panic
+                                // so need to manually add id and frame data again...
+                                format_args!(
+                                    "AT+send=1,0,{},{:?}|{:?}\r\n",
+                                    len,
+                                    id.to_bits(),
+                                    frame.data().unwrap()
+                                ),
+                            )
+                            .unwrap();
+                            calypso_write::spawn().unwrap();
+                        });
+                    }
+                    _ => {} // ignore broadcast messages
                 }
-                Id::Extended(id) => id,
-            };
-            let id: j1939::ExtendedId = id.into();
-
-            match id.pgn {
-                Pgn::Destination(pgn) => {
-                    // temp format string to get length
-                    let mut tmp_buf = [0_u8; 128];
-                    let tmp_pack = write_to::show(
-                        &mut tmp_buf,
-                        format_args!("{:?}|{:?}", id.to_bits(), frame.data().unwrap()),
-                    ).unwrap();
-                    let len = tmp_pack.len();
-
-
-                    // Serialize can frame and send over Wifi
-                    cx.shared.can_packet_buf.lock(|buf| {
-                        let _can_packet = write_to::show(
-                            buf,
-                            // hardcode length for now but this may need to be calculated
-                            // for some reason, putting tmp_buf in here causes panic
-                            // so need to manually add id and frame data again...
-                            format_args!("AT+send=1,0,{},{:?}|{:?}\r\n", len, id.to_bits(), frame.data().unwrap()),
-                        ).unwrap();
-                        calypso_write::spawn().unwrap();
-                    });
-                },
-                _ => {} // ignore broadcast messages
             }
         });
     }
 
-    fn send_frame(data: &[u8], frame_sender: &mut FrameSender<Box<SerialDMAPool>, TxDma<Tx<USART2>, dma::dma1::C7>, 128>) {
+    fn send_frame(
+        data: &[u8],
+        frame_sender: &mut FrameSender<
+            Box<SerialDMAPool>,
+            TxDma<Tx<USART2>, dma::dma1::C7>,
+            128,
+        >,
+    ) {
         if let Some(dma_buf) = SerialDMAPool::alloc() {
             let mut dma_buf = dma_buf.init(DMAFrame::new());
             let _buf_size = dma_buf.write_slice(data);
