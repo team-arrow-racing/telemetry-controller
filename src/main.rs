@@ -52,8 +52,23 @@ use stm32l4xx_hal::{
     dma::{self, DMAFrame, FrameReader, FrameSender, RxDma, TxDma},
     flash::FlashExt,
     gpio::{
-        Alternate, OpenDrain, Output, PushPull, Speed, PA11, PA12, PA4, PA5,
-        PA6, PA7, PB13, PB8, PB9, PC12, PC8, PC9, PD2,
+        Alternate, OpenDrain, Output, PushPull, Speed,
+        PA2, // UART TX
+        PA3, // UART RX
+        PA4, // LED_1
+        PA5, // LED_2
+        PA11, // USB_DM
+        PA12, // USB_DP
+        PB2, // STATUS_IND_1
+        PB8, // CAN RX
+        PB9, // CAN TX
+        PB10, // STATUS_IND_0
+        PB12, // SD CMD (SPI2_NSS)
+        PB13, // SD CK (SPI2_SCK)
+        PB14, // SD_D0 (SPI2_MISO)
+        PB15, // SD_D1 (SPI2_MOSI)
+        PC4, // APP_MODE_1
+        PC5, // APP_MODE_0
     },
     pac::{SDMMC, SPI1, SPI2, SPI3, USART2},
     prelude::*,
@@ -165,7 +180,16 @@ mod app {
     pub type Duration = fugit::TimerDuration<u64, SYSCLK>;
     pub type Instant = fugit::TimerInstant<u64, SYSCLK>;
 
-    type Can1Pins = (PA12<Alternate<PushPull, 9>>, PA11<Alternate<PushPull, 9>>);
+    type Can1Pins = (PB9<Alternate<PushPull, 9>>, PB8<Alternate<PushPull, 9>>);
+    type Spi2Pins = (
+        PB13<Alternate<PushPull, 5>>,
+        PB14<Alternate<PushPull, 5>>,
+        PB15<Alternate<PushPull, 5>>,
+    );
+    type DMAFrameSender = FrameSender<
+                            Box<SerialDMAPool>,
+                            TxDma<Tx<USART2>, dma::dma1::C7>,
+                            128>;
 
     #[shared]
     struct Shared {
@@ -182,19 +206,19 @@ mod app {
         >,
         delay: DelayCM,
         can_packet_buf: [u8; 128],
+        #[lock_free]
+        socket_id: u32,
+        #[lock_free]
+        ok_received: bool
     }
-
-    type Spi1Pins = (
-        PA5<Alternate<PushPull, 5>>,
-        PA6<Alternate<PushPull, 5>>,
-        PA7<Alternate<PushPull, 5>>,
-    );
 
     #[local]
     struct Local {
         watchdog: IndependentWatchdog,
-        status_led: PB13<Output<PushPull>>,
-        spi_dev: SdCard<Spi<SPI1, Spi1Pins>, PA4<Output<OpenDrain>>, DelayCM>,
+        status_led: PA5<Output<PushPull>>,
+        spi_dev: SdCard<Spi<SPI2, Spi2Pins>, PB12<Output<OpenDrain>>, DelayCM>,
+        init_sent: bool,
+        init_received: bool,
     }
 
     #[init]
@@ -212,8 +236,6 @@ mod app {
         let mut pwr = cx.device.PWR.constrain(&mut rcc.apb1r1);
         let mut gpioa = cx.device.GPIOA.split(&mut rcc.ahb2);
         let mut gpiob = cx.device.GPIOB.split(&mut rcc.ahb2);
-        let mut gpioc = cx.device.GPIOC.split(&mut rcc.ahb2);
-        let mut gpiod = cx.device.GPIOD.split(&mut rcc.ahb2);
 
         // configure system clock
         let clocks = rcc.cfgr.sysclk(80.MHz()).freeze(&mut flash.acr, &mut pwr);
@@ -227,38 +249,26 @@ mod app {
         );
 
         // let timer2 = cx.device.TIM2.timer(1.kHz(), device.peripheral.TIM2, &mut device.clocks);
-        let mut delay = DelayCM::new(clocks);
+        let delay = DelayCM::new(clocks);
         // delay.delay_ms(500_u32);
 
         // configure status led
-        let status_led = gpiob
-            .pb13
-            .into_push_pull_output(&mut gpiob.moder, &mut gpiob.otyper);
+        let status_led = gpioa
+            .pa5
+            .into_push_pull_output(&mut gpioa.moder, &mut gpioa.otyper);
 
         // configure can bus
         let can = {
-            let rx = gpioa.pa11.into_alternate(
-                &mut gpioa.moder,
-                &mut gpioa.otyper,
-                &mut gpioa.afrh,
+            let rx = gpiob.pb8.into_alternate(
+                &mut gpiob.moder,
+                &mut gpiob.otyper,
+                &mut gpiob.afrh,
             );
-            let tx = gpioa.pa12.into_alternate(
-                &mut gpioa.moder,
-                &mut gpioa.otyper,
-                &mut gpioa.afrh,
+            let tx = gpiob.pb9.into_alternate(
+                &mut gpiob.moder,
+                &mut gpiob.otyper,
+                &mut gpiob.afrh,
             );
-
-            // Pin out for the actual board
-            // let rx = gpiob.pb8.into_alternate(
-            //     &mut gpiob.moder,
-            //     &mut gpiob.otyper,
-            //     &mut gpiob.afrh,
-            // );
-            // let tx = gpiob.pb9.into_alternate(
-            //     &mut gpiob.moder,
-            //     &mut gpiob.otyper,
-            //     &mut gpiob.afrh,
-            // );
 
             let can = bxcan::Can::builder(Can::new(
                 &mut rcc.apb1r1,
@@ -288,36 +298,36 @@ mod app {
         };
 
         // Configure SPI
-        let sck = gpioa.pa5.into_alternate(
-            &mut gpioa.moder,
-            &mut gpioa.otyper,
-            &mut gpioa.afrl,
+        let sck = gpiob.pb13.into_alternate(
+            &mut gpiob.moder,
+            &mut gpiob.otyper,
+            &mut gpiob.afrh,
         );
 
-        let miso = gpioa.pa6.into_alternate(
-            &mut gpioa.moder,
-            &mut gpioa.otyper,
-            &mut gpioa.afrl,
+        let miso = gpiob.pb14.into_alternate(
+            &mut gpiob.moder,
+            &mut gpiob.otyper,
+            &mut gpiob.afrh,
         );
 
-        let mosi = gpioa.pa7.into_alternate(
-            &mut gpioa.moder,
-            &mut gpioa.otyper,
-            &mut gpioa.afrl,
+        let mosi = gpiob.pb15.into_alternate(
+            &mut gpiob.moder,
+            &mut gpiob.otyper,
+            &mut gpiob.afrh,
         );
 
-        let spi = Spi::spi1(
-            cx.device.SPI1,
+        let spi = Spi::spi2(
+            cx.device.SPI2,
             (sck, miso, mosi),
             MODE,
             16.MHz(),
             clocks,
-            &mut rcc.apb2,
+            &mut rcc.apb1r1,
         );
 
-        let spi_cs_pin = gpioa
-            .pa4
-            .into_open_drain_output(&mut gpioa.moder, &mut gpioa.otyper);
+        let spi_cs_pin = gpiob
+            .pb12
+            .into_open_drain_output(&mut gpiob.moder, &mut gpiob.otyper);
 
         let spi_dev = SdCard::new(spi, spi_cs_pin, delay);
 
@@ -381,14 +391,14 @@ mod app {
         // Send initial packet to calypso to get it into AT command mode
         // The calypso will send an error message back which can be ignored
         send_frame(b"AT+test\r\n", &mut frame_sender);
-        // delay.delay_ms(1000_u32);
+        // delay.delay_ms(2000_u32);
+        // send_frame(b"AT+connect=0,INET,8888,10.123.45.1\r\n", &mut frame_sender);
+        connect_calypso::spawn_after(Duration::millis(2000)).unwrap();
         // send_frame(b"AT+connect=0,INET,8888,192.168.1.168\r\n", &mut frame_sender);
 
         // start main loop
         run::spawn().unwrap();
-        demo_lighting::spawn_after(Duration::millis(1000)).unwrap();
-        // wait for bit for calypso to boot up
-        // write_dma_frames::spawn_after(Duration::millis(2000)).unwrap();
+        heartbeat::spawn().unwrap();
 
         (
             Shared {
@@ -397,11 +407,15 @@ mod app {
                 frame_sender,
                 delay,
                 can_packet_buf,
+                socket_id: 0,
+                ok_received: false
             },
             Local {
                 watchdog,
                 status_led,
                 spi_dev,
+                init_sent: false,
+                init_received: false,
             },
             init::Monotonics(mono),
         )
@@ -416,8 +430,36 @@ mod app {
         run::spawn_after(Duration::millis(10)).unwrap();
     }
 
+    /// Connects to the chase car calypso
+    #[task(shared = [frame_sender])]
+    fn connect_calypso(mut cx: connect_calypso::Context) {
+        defmt::trace!("task: connect calypso");
+
+        cx.shared.frame_sender.lock(|fs| {
+            send_frame(b"AT+wlanconnect=calypso_6847491171c9,,WPA_WPA2,calypsowlan,,,\r\nAT+socket=INET,STREAM,TCP\r\n", fs);
+            // after this message, a socket id will be received, progress the rest of the connection setup in 
+            // serial_isr
+        });
+    }
+
+    #[task(shared = [can], local = [status_led])]
+    fn heartbeat(mut cx: heartbeat::Context) {
+        defmt::trace!("task: heartbeat");
+
+        cx.local.status_led.toggle();
+
+        if cx.local.status_led.is_set_low() {
+            cx.shared.can.lock(|can| {
+                let _ = can.transmit(&com::heartbeat::message(DEVICE));
+            });
+        }
+
+        // repeat every second
+        heartbeat::spawn_after(500.millis().into()).unwrap();
+    }
+
     /// This task handles the character match interrupt at required by the `FrameReader`
-    #[task(binds = USART2, shared = [frame_reader, frame_sender])]
+    #[task(binds = USART2, local=[init_sent, init_received], shared = [socket_id, ok_received, frame_reader, frame_sender])]
     fn serial_isr(mut cx: serial_isr::Context) {
         // Check for character match
         cx.shared.frame_reader.lock(|fr| {
@@ -426,9 +468,46 @@ mod app {
                     let dma_buf = dma_buf.init(DMAFrame::new());
                     let buf = fr.character_match_interrupt(dma_buf);
 
-                    // let res = core::str::from_utf8(buf.read()).unwrap();
                     match core::str::from_utf8(buf.read()) {
-                        Ok(res) => defmt::debug!("RESPONSE: {:?}", res),
+                        Ok(res) => {
+                            if res.contains("OK\r\n") {
+                                // TODO don't attempt to receive until value is true
+                                *cx.shared.ok_received = true;
+
+                                if *cx.local.init_sent { *cx.local.init_received = true; }
+
+                                if *cx.local.init_received && *cx.local.init_sent {
+                                    // demo_lighting::spawn_after(Duration::millis(2000)).unwrap();
+                                    calypso_read::spawn_after(Duration::millis(2000)).unwrap();
+                                    // Avoid starting this thread multiple times
+                                    *cx.local.init_sent = false;
+                                }
+
+                                // TODO is this a receive? check that received was sent first
+                            }
+                            else if res.contains("+socket:") {
+                                // Socket ID received
+                                *cx.shared.socket_id = res.chars().nth(8).unwrap().to_digit(10).unwrap();
+                                defmt::debug!("socket set as {}", cx.shared.socket_id);
+                                
+                                cx.shared.frame_sender.lock(|fs| {
+                                    let mut socket_buf = [0; 128];
+                                    let _can_packet = write_to::show(
+                                        &mut socket_buf,
+                                        format_args!(
+                                            "AT+connect={},INET,8888,10.123.45.1\r\nAT+listen={},10",
+                                            cx.shared.socket_id,
+                                            cx.shared.socket_id
+                                        ),
+                                    )
+                                    .unwrap();
+                                    send_frame(&socket_buf, fs);
+
+                                    *cx.local.init_sent = true;
+                                });
+                            }
+                            defmt::debug!("RESPONSE: {:?}", res)
+                        },
                         _ => defmt::debug!("Pacnied"),
                     }
                     // TODO this will be instructions given from Profinity
@@ -477,10 +556,10 @@ mod app {
             let _ = can.transmit(&test_frame);
         });
 
-        demo_lighting::spawn_after(Duration::millis(1000)).unwrap();
+        demo_lighting::spawn_after(Duration::millis(5000)).unwrap();
     }
 
-    #[task(shared = [frame_sender, can_packet_buf])]
+    #[task(shared = [frame_sender, can_packet_buf, socket_id])]
     fn calypso_write(mut cx: calypso_write::Context) {
         // let mut buffer = [0; 128];
         // TODO consider using at commands crate, but this does not append
@@ -493,26 +572,41 @@ mod app {
 
         cx.shared.frame_sender.lock(|fs| {
             cx.shared.can_packet_buf.lock(|buf| {
-                defmt::debug!(
-                    "Writing {:?}",
-                    core::str::from_utf8(buf).unwrap()
-                );
-                send_frame(buf, fs);
+
+                let mut socket_buf = [0; 25];
+                let _can_packet = write_to::show(
+                    &mut socket_buf,
+                    format_args!(
+                        "AT+send={},0,5,hello\r\n",
+                        cx.shared.socket_id
+                    ),
+                )
+                .unwrap();
+                send_frame(&socket_buf, fs)
+                // send_frame(buf, fs);
             });
         });
     }
 
-    #[task(shared = [frame_sender])]
+    #[task(shared = [delay, frame_sender, socket_id, ok_received])]
     fn calypso_read(mut cx: calypso_read::Context) {
         // let mut buffer = [0; 128];
         // TODO consider using at commands crate, but this does not append
         // string parameters properly
-        let cmd = b"AT+recv=1,0,32\r\n";
+        let mut socket_buf = [0; 25];
+        let _can_packet = write_to::show(
+            &mut socket_buf,
+            format_args!(
+                "AT+recv={},0,32\r\n",
+                cx.shared.socket_id
+            ),
+        )
+        .unwrap();
 
-        defmt::debug!("Writing {:?}", core::str::from_utf8(cmd).unwrap());
-
+        // TODO need to wait for OK to be received before requesting another read
         cx.shared.frame_sender.lock(|fs| {
-            send_frame(cmd, fs);
+            send_frame(&socket_buf, fs);
+            *cx.shared.ok_received = false;
             // We should receive OK followed by +recv:1,0,{size},data, followed by another OK in UART
         });
 
@@ -594,14 +688,8 @@ mod app {
         });
     }
 
-    fn send_frame(
-        data: &[u8],
-        frame_sender: &mut FrameSender<
-            Box<SerialDMAPool>,
-            TxDma<Tx<USART2>, dma::dma1::C7>,
-            128,
-        >,
-    ) {
+    fn send_frame(data: &[u8], frame_sender: &mut DMAFrameSender) {
+        
         if let Some(dma_buf) = SerialDMAPool::alloc() {
             let mut dma_buf = dma_buf.init(DMAFrame::new());
             let _buf_size = dma_buf.write_slice(data);
